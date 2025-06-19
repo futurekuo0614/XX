@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>日⇄中 即時字幕 (Vercel 版)</title>
+<style>
+  body{font-family:Arial,Helvetica,sans-serif;max-width:900px;margin:2rem auto;}
+  button,select,input[type=range]{margin-right:0.5rem;padding:0.45rem 1rem;font-size:1rem;}
+  #live-caption{min-height:3rem;border:1px solid #ccc;padding:0.5rem;font-size:1.4rem;font-weight:bold;margin-bottom:1rem;}
+  #subtitles{border:1px solid #eee;max-height:320px;overflow-y:auto;padding:0.5rem;white-space:pre-wrap;}
+  .interim{color:#888;}
+</style>
+</head>
+<body>
+<h1>日⇄中 即時字幕</h1>
+<p style="color:#666;font-size:0.9rem">
+  本頁面示範 GitHub + Vercel 全靜態部署：翻譯請求經由 <code>/api/openai</code> proxy，
+  API Key 儲存在 Vercel 環境變數中。前端不含任何金鑰。
+</p>
+
+<div>
+  <button id="start">Start</button>
+  <button id="stop" disabled>Stop</button>
+  <button id="download" disabled>Download&nbsp;SRT</button>
+  <select id="direction">
+    <option value="zh2ja">中 → 日</option>
+    <option value="ja2zh">日 → 中</option>
+  </select>
+</div>
+<div style="margin:0.8rem 0;">
+  監聽音量 <input type="range" id="gainSlider" min="0" max="300" value="150">
+  <span id="gainLabel">1.5×</span>
+</div>
+
+<div id="live-caption"></div>
+<h2>Subtitle log</h2>
+<div id="subtitles"></div>
+
+<script>
+window.SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+window.SpeechGrammarList = window.SpeechGrammarList || window.webkitSpeechGrammarList;
+
+// UI
+const startBtn = document.getElementById('start');
+const stopBtn  = document.getElementById('stop');
+const downloadBtn = document.getElementById('download');
+const dirSel = document.getElementById('direction');
+const liveDiv = document.getElementById('live-caption');
+const logDiv  = document.getElementById('subtitles');
+const gainSlider = document.getElementById('gainSlider');
+const gainLabel = document.getElementById('gainLabel');
+
+let recA=null, recB=null, active=null, standby=null;
+let isUserStopping=false;
+let subtitleLines=[], lastT=null;
+let rafScroll=null;
+let audioCtx=null, gainNode=null, micStream=null;
+
+function grammarFor(lang){
+  const words = lang.startsWith('zh') ? ['融資','卡車','投資','資金'] : ['トラック','投資','資金','連携'];
+  return '#JSGF V1.0; grammar hotwords; public <hot> = ' + words.join(' | ') + ' ;';
+}
+function buildRecognizer(lang){
+  const r = new SpeechRecognition();
+  r.lang = lang;
+  r.continuous = true;
+  r.interimResults = true;
+  try{
+    const list = new SpeechGrammarList();
+    list.addFromString(grammarFor(lang),1);
+    r.grammars = list;
+  }catch(e){}
+  r.onresult = handleResult;
+  r.onend = ()=> setTimeout(()=>{ if(!isUserStopping){ handoff(); } }, 60);
+  r.onerror = ()=> setTimeout(()=>{ if(!isUserStopping){ handoff(); } }, 80);
+  return r;
+}
+function currentLang(){ return dirSel.value==='zh2ja' ? 'zh-TW' : 'ja-JP'; }
+
+function handoff(){
+  standby.lang = currentLang();
+  try{ standby.start(); }catch(e){}
+  [active, standby] = [standby, active];
+}
+function startRecognition(){
+  recA = buildRecognizer(currentLang());
+  recB = buildRecognizer(currentLang());
+  active = recA; standby = recB;
+  active.start();
+}
+function stopRecognition(){
+  try{ active.stop(); standby.stop(); }catch(e){}
+}
+
+function fmt(ms){
+  const t=Math.floor(ms/1000);
+  const h=String(Math.floor(t/3600)).padStart(2,'0');
+  const m=String(Math.floor((t%3600)/60)).padStart(2,'0');
+  const s=String(t%60).padStart(2,'0');
+  const msStr=String(ms%1000).padStart(3,'0');
+  return `${h}:${m}:${s},${msStr}`;
+}
+function scrollLog(){
+  if(rafScroll) cancelAnimationFrame(rafScroll);
+  rafScroll = requestAnimationFrame(()=>{ logDiv.scrollTop=logDiv.scrollHeight; });
+}
+
+async function translate(text){
+  const resp = await fetch('/api/openai',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({ text, direction: dirSel.value })
+  });
+  const data = await resp.json();
+  return data.result || '(error)';
+}
+
+function updateInterim(text){ liveDiv.innerHTML = text ? `<span class="interim">${text}</span>` : ''; }
+function addLog(line){ logDiv.textContent += '\n' + line; scrollLog(); }
+
+function handleResult(e){
+  let interim='';
+  for(let i=e.resultIndex;i<e.results.length;++i){
+    const res=e.results[i], txt=res[0].transcript.trim();
+    if(res.isFinal){
+      const now=Date.now();
+      const st=lastT||now, et=now; lastT=now;
+      subtitleLines.push({start:st,end:et,text:txt});
+      addLog(`${new Date().toLocaleTimeString()}  ${txt}`);
+      translate(txt).then(t=> addLog('→ '+t));
+    }else interim+=txt+' ';
+  }
+  updateInterim(interim);
+}
+
+// Mic monitor
+async function setupMic(){
+  audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+  micStream = await navigator.mediaDevices.getUserMedia({audio:true});
+  const src = audioCtx.createMediaStreamSource(micStream);
+  gainNode = audioCtx.createGain();
+  gainNode.gain.value = parseFloat(gainSlider.value)/100;
+  src.connect(gainNode).connect(audioCtx.destination);
+}
+gainSlider.oninput = ()=>{ if(gainNode){ gainNode.gain.value=parseFloat(gainSlider.value)/100; gainLabel.textContent=gainNode.gain.value.toFixed(2)+'×'; }};
+
+// Buttons
+startBtn.onclick = async ()=>{
+  isUserStopping=false;
+  subtitleLines=[]; lastT=null;
+  logDiv.textContent=''; liveDiv.textContent='';
+  startBtn.disabled=true; stopBtn.disabled=false; downloadBtn.disabled=true;
+  await setupMic();
+  startRecognition();
+};
+stopBtn.onclick = ()=>{
+  isUserStopping=true;
+  stopRecognition();
+  if(micStream){ micStream.getTracks().forEach(t=>t.stop()); micStream=null; }
+  if(audioCtx){ audioCtx.close(); audioCtx=null; }
+  startBtn.disabled=false; stopBtn.disabled=true;
+  downloadBtn.disabled=subtitleLines.length===0; liveDiv.textContent='';
+};
+downloadBtn.onclick = ()=>{
+  if(!subtitleLines.length) return;
+  const off=subtitleLines[0].start;
+  const srt=subtitleLines.map((l,i)=>`${i+1}\n${fmt(l.start-off)} --> ${fmt(l.end-off)}\n${l.text}\n`).join('\n');
+  const blob=new Blob([srt],{type:'text/plain'}); const url=URL.createObjectURL(blob);
+  const a=document.createElement('a'); a.href=url; a.download='captions.srt'; a.click(); URL.revokeObjectURL(url);
+};
+</script>
+</body>
+</html>
